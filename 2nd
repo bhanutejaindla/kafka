@@ -1,0 +1,205 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Milestone A2: Data Cleansing & Validation
+# MAGIC This notebook continues from Milestone A1, using the loaded enforced schema DataFrames and SQL views.
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F, Row
+from pyspark.sql.types import StringType, StructType, StructField, IntegerType, FloatType, TimestampType, DoubleType
+
+# COMMAND ----------
+# Define all datasets you created in A1
+data_dir = '/Volumes/workspace/default/hu_de_data/'
+
+csv_files = [
+    "olist_customers_dataset.csv",
+    "olist_geolocation_dataset.csv",
+    "olist_order_items_dataset.csv",
+    "olist_order_payments_dataset.csv",
+    "olist_order_reviews_dataset.csv",
+    "olist_orders_dataset.csv",
+    "olist_products_dataset.csv",
+    "olist_sellers_dataset.csv",
+    "product_category_name_translation.csv"
+]
+
+primary_keys = {
+    "olist_customers_dataset": ["customer_id"],
+    "olist_geolocation_dataset": [],
+    "olist_order_items_dataset": ["order_id", "order_item_id"],
+    "olist_order_payments_dataset": ["order_id", "payment_sequential"],
+    "olist_order_reviews_dataset": ["review_id"],
+    "olist_orders_dataset": ["order_id"],
+    "olist_products_dataset": ["product_id"],
+    "olist_sellers_dataset": ["seller_id"],
+    "product_category_name_translation": ["product_category_name"]
+}
+
+# COMMAND ----------
+# 🧩 1. Missing Value Identification & Handling
+# For each dataset, count missing values per column.
+
+missing_summary = []
+
+for fname in csv_files:
+    base = fname.replace(".csv", "")
+    df = spark.table(f"{base}_enforced")
+    row_count = df.count()
+
+    null_counts = {col: df.filter(F.col(col).isNull() | (F.trim(F.col(col)) == "")).count() for col in df.columns}
+    total_nulls = sum(null_counts.values())
+    missing_summary.append(Row(
+        file_name=fname,
+        row_count=row_count,
+        total_nulls=total_nulls,
+        null_counts=null_counts
+    ))
+
+missing_df = spark.createDataFrame(missing_summary)
+missing_df.createOrReplaceTempView("missing_value_summary")
+missing_df.show(truncate=False)
+
+# COMMAND ----------
+# 🧼 Decide and document how to handle nulls
+# Example strategy:
+# - Drop rows if PK is null
+# - Impute numeric columns with mean
+# - Impute string columns with 'Unknown'
+
+cleaned_dfs = {}
+cleansing_log = []
+
+for fname in csv_files:
+    base = fname.replace(".csv", "")
+    df = spark.table(f"{base}_enforced")
+    pk = primary_keys.get(base, [])
+    before_rows = df.count()
+
+    # Drop rows with null primary keys
+    if pk:
+        for p in pk:
+            df = df.filter(F.col(p).isNotNull())
+
+    # Impute numeric columns
+    numeric_cols = [c for c, t in df.dtypes if t in ("double", "float", "int")]
+    for c in numeric_cols:
+        mean_val = df.agg(F.mean(c)).first()[0]
+        if mean_val is not None:
+            df = df.na.fill({c: mean_val})
+
+    # Impute string columns
+    string_cols = [c for c, t in df.dtypes if t == "string"]
+    for c in string_cols:
+        df = df.na.fill({c: "Unknown"})
+
+    after_rows = df.count()
+
+    cleansing_log.append(Row(
+        file_name=fname,
+        action="Null handling",
+        rows_before=before_rows,
+        rows_after=after_rows,
+        difference=before_rows - after_rows
+    ))
+
+    cleaned_dfs[base] = df
+    df.createOrReplaceTempView(f"{base}_cleaned")
+
+# COMMAND ----------
+# 🧮 2. Duplicate Detection & Resolution
+# Detect duplicates on primary keys
+
+for fname in csv_files:
+    base = fname.replace(".csv", "")
+    df = spark.table(f"{base}_cleaned")
+    pk = primary_keys.get(base, [])
+    before_rows = df.count()
+
+    if pk:
+        dup_count = df.groupBy(pk).count().filter("count > 1").count()
+        df = df.dropDuplicates(pk)
+        after_rows = df.count()
+
+        cleansing_log.append(Row(
+            file_name=fname,
+            action="Duplicate removal",
+            rows_before=before_rows,
+            rows_after=after_rows,
+            difference=before_rows - after_rows,
+            duplicates_found=dup_count
+        ))
+
+        cleaned_dfs[base] = df
+        df.createOrReplaceTempView(f"{base}_cleaned")
+    else:
+        cleansing_log.append(Row(
+            file_name=fname,
+            action="Duplicate check skipped (no PK)",
+            rows_before=before_rows,
+            rows_after=before_rows,
+            difference=0
+        ))
+
+# COMMAND ----------
+# 📅 3. Data Type & Format Consistency
+# Verify column data types match schema
+# Example: standardize date formats to yyyy-MM-dd HH:mm:ss
+
+for fname in csv_files:
+    base = fname.replace(".csv", "")
+    df = cleaned_dfs[base]
+
+    for c, t in df.dtypes:
+        # If column looks like a timestamp string, try to cast it
+        if "date" in c.lower() or "timestamp" in c.lower():
+            df = df.withColumn(c, F.to_timestamp(c))
+
+        # Convert string case
+        if t == "string":
+            df = df.withColumn(c, F.initcap(F.col(c)))
+
+    cleaned_dfs[base] = df
+    df.createOrReplaceTempView(f"{base}_cleaned")
+
+# COMMAND ----------
+# 🔢 4. Value Range & Validity Checks
+# Example checks for logical ranges: non-negative prices, valid dates
+
+for fname in ["olist_order_items_dataset.csv", "olist_order_payments_dataset.csv"]:
+    base = fname.replace(".csv", "")
+    df = cleaned_dfs[base]
+    before_rows = df.count()
+
+    if "price" in df.columns:
+        df = df.filter(F.col("price") >= 0)
+    if "freight_value" in df.columns:
+        df = df.filter(F.col("freight_value") >= 0)
+    if "payment_value" in df.columns:
+        df = df.filter(F.col("payment_value") >= 0)
+
+    after_rows = df.count()
+    cleansing_log.append(Row(
+        file_name=fname,
+        action="Value range check",
+        rows_before=before_rows,
+        rows_after=after_rows,
+        difference=before_rows - after_rows
+    ))
+
+    cleaned_dfs[base] = df
+    df.createOrReplaceTempView(f"{base}_cleaned")
+
+# COMMAND ----------
+# 🧾 5. Document Cleansing Actions
+cleansing_log_df = spark.createDataFrame(cleansing_log)
+cleansing_log_df.createOrReplaceTempView("cleansing_log")
+cleansing_log_df.show(truncate=False)
+
+# COMMAND ----------
+# ✅ Final Sanity Check
+for base, df in cleaned_dfs.items():
+    print(f"\n=== {base}_cleaned ===")
+    df.printSchema()
+    print(f"Row count: {df.count()}")
+    df.show(3)
