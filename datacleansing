@@ -1,0 +1,114 @@
+from pyspark.sql import functions as F, Row
+import os
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# ✅ Existing volume path (adjust this if your volume name differs)
+base_path = "/Volumes/workspace/default/hu_de_data/"
+
+# ✅ List of datasets to process
+datasets = {
+    "olist_customers_dataset": "olist_customers_dataset.delta",
+    "olist_products_dataset": "olist_products_dataset.delta",
+    "olist_order_payments_dataset": "olist_order_payments_dataset.delta"
+}
+
+# ✅ Define primary keys for each dataset
+primary_keys = {
+    "olist_customers_dataset": ["customer_id"],
+    "olist_products_dataset": ["product_id"],
+    "olist_order_payments_dataset": ["order_id"]
+}
+
+# ============================================================
+# STEP 1️⃣ — Load Datasets (from Delta)
+# ============================================================
+
+dfs_enforced = {}
+
+for name, rel_path in datasets.items():
+    path = os.path.join(base_path, rel_path)
+    print(f"📂 Loading: {path}")
+    try:
+        df = spark.read.format("delta").load(path)
+        dfs_enforced[name] = df
+        print(f"✅ Loaded {name} ({df.count()} rows)")
+    except Exception as e:
+        print(f"⚠️ Could not load {name}: {e}")
+
+# ============================================================
+# STEP 2️⃣ — Handle Missing Values
+# ============================================================
+
+cleaned_dfs = {}
+cleansing_log = []
+
+for base, df in dfs_enforced.items():
+    print(f"\n🧹 Processing dataset: {base}")
+
+    # Get PKs if available
+    pk = primary_keys.get(base, [])
+
+    # Row count before cleaning
+    before_rows = df.count()
+
+    # 🧹 Drop rows with null primary keys
+    if pk:
+        for p in pk:
+            df = df.filter(F.col(p).isNotNull())
+
+    # 🧮 Fill numeric nulls with mean
+    numeric_cols = [c for c, t in df.dtypes if t in ("double", "float", "int", "bigint")]
+    for c in numeric_cols:
+        mean_val = df.select(F.mean(F.col(c))).first()[0]
+        if mean_val is not None:
+            df = df.na.fill({c: mean_val})
+
+    # 🔤 Fill string nulls with "Unknown"
+    string_cols = [c for c, t in df.dtypes if t == "string"]
+    for c in string_cols:
+        df = df.na.fill({c: "Unknown"})
+
+    # Row count after cleaning
+    after_rows = df.count()
+
+    # 📝 Log results
+    cleansing_log.append(Row(
+        dataset=base,
+        action="Null handling",
+        before=before_rows,
+        after=after_rows,
+        change=before_rows - after_rows
+    ))
+
+    # Store cleaned DF + create SQL view
+    cleaned_dfs[base] = df
+    df.createOrReplaceTempView(f"{base}_cleaned")
+
+    print(f"✅ {base}: cleaned successfully ({before_rows} → {after_rows} rows)")
+
+# ============================================================
+# STEP 3️⃣ — Generate Cleansing Summary Log
+# ============================================================
+
+cleansing_log_df = spark.createDataFrame(cleansing_log)
+cleansing_log_df.createOrReplaceTempView("cleansing_log_summary")
+
+print("\n✅ Data Cleansing Completed! Summary:\n")
+cleansing_log_df.show(truncate=False)
+
+# ============================================================
+# STEP 4️⃣ — Save Cleaned Data to Delta
+# ============================================================
+
+for base, df in cleaned_dfs.items():
+    output_path = os.path.join(base_path, f"{base}_cleaned.delta")
+    try:
+        df.write.mode("overwrite").format("delta").save(output_path)
+        print(f"💾 Saved cleaned dataset to: {output_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to save {base}: {e}")
+
+print("\n🎉 All datasets cleaned and saved successfully!")
