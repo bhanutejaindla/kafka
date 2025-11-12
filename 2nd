@@ -1,47 +1,39 @@
+# stream_producer.py
 from kafka import KafkaProducer
-import json, time
+import json, time, random
 
 producer = KafkaProducer(
     bootstrap_servers='localhost:9092',
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
-print("🚀 Sending streaming data to topic: input_topic")
+print("🚀 Streaming producer started (topic: demo_topic)")
 
 i = 0
 while True:
-    msg = {"id": i, "message": f"Hello Kafka Stream {i}"}
-    producer.send("input_topic", msg)
-    print("✅ Sent:", msg)
+    message = {"id": i, "value": random.randint(1, 100)}
+    producer.send("demo_topic", message)
+    print("✅ Sent:", message)
     i += 1
     time.sleep(2)  # send every 2 seconds
 
+# stream_consumer.py
+from kafka import KafkaConsumer
+import json
 
+consumer = KafkaConsumer(
+    "demo_topic",
+    bootstrap_servers="localhost:9092",
+    auto_offset_reset="latest",
+    value_deserializer=lambda v: json.loads(v.decode('utf-8'))
+)
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import expr
+print("📡 Stream consumer listening to topic: demo_topic")
 
-spark = SparkSession.builder.appName("KafkaStreamConsumer").getOrCreate()
+for msg in consumer:
+    print("🟢 Received:", msg.value)
 
-df_stream = spark.readStream.format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "input_topic") \
-    .option("startingOffsets", "latest") \
-    .load()
-
-df_stream = df_stream.selectExpr("CAST(value AS STRING) as json_value")
-
-# You can parse the JSON if needed, e.g. using from_json
-df_transformed = df_stream.withColumn("processed_time", expr("current_timestamp()"))
-
-query = df_transformed.writeStream \
-    .format("console") \
-    .option("truncate", "false") \
-    .start()
-
-query.awaitTermination()
-
-
+# batch_producer.py
 from kafka import KafkaProducer
 import json
 
@@ -51,33 +43,47 @@ producer = KafkaProducer(
 )
 
 data = [
-    {"id": 1, "message": "Batch message 1"},
-    {"id": 2, "message": "Batch message 2"},
-    {"id": 3, "message": "Batch message 3"}
+    {"id": 1, "name": "Bhanu", "city": "Hyderabad"},
+    {"id": 2, "name": "Teja", "city": "Vizag"},
+    {"id": 3, "name": "Indla", "city": "Chennai"}
 ]
 
 for record in data:
-    producer.send("input_topic", record)
+    producer.send("demo_topic", record)
     print("✅ Sent:", record)
 
 producer.flush()
-print("🎯 All batch data sent to Kafka topic: input_topic")
+print("🎯 Batch data sent successfully to Kafka topic: demo_topic")
 
 
-from pyspark.sql import SparkSession
+# batch_consumer.py
+from kafka import KafkaConsumer
+import json
+import csv
 
-spark = SparkSession.builder.appName("KafkaBatchConsumer").getOrCreate()
+consumer = KafkaConsumer(
+    "demo_topic",
+    bootstrap_servers="localhost:9092",
+    auto_offset_reset="earliest",
+    enable_auto_commit=False,
+    value_deserializer=lambda v: json.loads(v.decode('utf-8'))
+)
 
-df_batch = spark.read.format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "input_topic") \
-    .option("startingOffsets", "earliest") \
-    .option("endingOffsets", "latest") \
-    .load()
+print("📦 Batch consumer reading all messages from topic...")
 
-df_batch = df_batch.selectExpr("CAST(value AS STRING) as message")
+records = []
+for msg in consumer:
+    print("🟢 Got:", msg.value)
+    records.append(msg.value)
 
-df_batch.show(truncate=False)
-df_batch.write.mode("overwrite").parquet("/tmp/kafka_batch_output")
+    # Exit after reading 10 messages (simulate batch job)
+    if len(records) >= 10:
+        break
 
-print("✅ Kafka batch data written to /tmp/kafka_batch_output")
+# Write to CSV
+with open("kafka_output.csv", "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=records[0].keys())
+    writer.writeheader()
+    writer.writerows(records)
+
+print("✅ Wrote", len(records), "messages to kafka_output.csv")
