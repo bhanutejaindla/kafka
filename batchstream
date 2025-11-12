@@ -1,0 +1,110 @@
+"""
+Kafka Read/Write Demo — 4 Modes (Simple Example)
+------------------------------------------------
+Make sure Kafka and Zookeeper are running:
+    brew services start zookeeper
+    brew services start kafka
+
+Then create topics:
+    kafka-topics --create --topic input_topic --bootstrap-server localhost:9092
+    kafka-topics --create --topic output_topic --bootstrap-server localhost:9092
+
+Run:
+    python kafka_pipeline_demo.py stream-to-stream
+    python kafka_pipeline_demo.py stream-to-batch
+    python kafka_pipeline_demo.py batch-to-batch
+    python kafka_pipeline_demo.py batch-to-stream
+"""
+
+import sys
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import expr, lit
+
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("KafkaPipelineDemo") \
+    .getOrCreate()
+
+mode = sys.argv[1] if len(sys.argv) > 1 else "stream-to-stream"
+print(f"🚀 Running mode: {mode}")
+
+BOOTSTRAP = "localhost:9092"
+INPUT_TOPIC = "input_topic"
+OUTPUT_TOPIC = "output_topic"
+
+# ====================================================
+# 1️⃣ STREAM → STREAM : Read Kafka Stream → Write Kafka Stream
+# ====================================================
+if mode == "stream-to-stream":
+    df_stream = spark.readStream.format("kafka") \
+        .option("kafka.bootstrap.servers", BOOTSTRAP) \
+        .option("subscribe", INPUT_TOPIC) \
+        .option("startingOffsets", "latest") \
+        .load()
+
+    df_stream = df_stream.selectExpr("CAST(value AS STRING) as message")
+    df_transformed = df_stream.withColumn("processed_time", expr("current_timestamp()"))
+
+    query = df_transformed.selectExpr("CAST(message AS STRING) AS value") \
+        .writeStream.format("kafka") \
+        .option("kafka.bootstrap.servers", BOOTSTRAP) \
+        .option("topic", OUTPUT_TOPIC) \
+        .option("checkpointLocation", "/tmp/checkpoint_stream_to_stream") \
+        .start()
+
+    query.awaitTermination()
+
+# ====================================================
+# 2️⃣ STREAM → BATCH : Read Kafka Stream → Write Delta
+# ====================================================
+elif mode == "stream-to-batch":
+    df_stream = spark.readStream.format("kafka") \
+        .option("kafka.bootstrap.servers", BOOTSTRAP) \
+        .option("subscribe", INPUT_TOPIC) \
+        .option("startingOffsets", "latest") \
+        .load()
+
+    df_stream = df_stream.selectExpr("CAST(value AS STRING) as message")
+
+    query = df_stream.writeStream.outputMode("append") \
+        .format("parquet") \
+        .option("path", "/tmp/stream_to_batch_output") \
+        .option("checkpointLocation", "/tmp/checkpoint_stream_to_batch") \
+        .start()
+
+    query.awaitTermination()
+
+# ====================================================
+# 3️⃣ BATCH → BATCH : Read Kafka Once → Write Parquet
+# ====================================================
+elif mode == "batch-to-batch":
+    df_batch = spark.read.format("kafka") \
+        .option("kafka.bootstrap.servers", BOOTSTRAP) \
+        .option("subscribe", INPUT_TOPIC) \
+        .option("startingOffsets", "earliest") \
+        .option("endingOffsets", "latest") \
+        .load()
+
+    df_batch = df_batch.selectExpr("CAST(value AS STRING) as message")
+    df_batch.write.mode("overwrite").parquet("/tmp/kafka_batch_to_batch")
+    print("✅ Wrote batch data to /tmp/kafka_batch_to_batch")
+
+# ====================================================
+# 4️⃣ BATCH → STREAM : Read File → Write to Kafka
+# ====================================================
+elif mode == "batch-to-stream":
+    # Prepare tiny sample dataset
+    data = [("Hello Kafka!",), ("This is Bhanu’s test.",), ("Stream demo done!",)]
+    df = spark.createDataFrame(data, ["text"])
+
+    df_to_kafka = df.selectExpr("CAST(text AS STRING) AS value")
+
+    df_to_kafka.write.format("kafka") \
+        .option("kafka.bootstrap.servers", BOOTSTRAP) \
+        .option("topic", INPUT_TOPIC) \
+        .save()
+
+    print("✅ Published sample data to Kafka topic:", INPUT_TOPIC)
+
+else:
+    print("❌ Invalid mode! Choose one of: stream-to-stream, stream-to-batch, batch-to-batch, batch-to-stream")
