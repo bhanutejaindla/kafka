@@ -1,0 +1,136 @@
+# ================================================================
+# 🧪 MILESTONE 5: DATA VALIDATION & QUALITY CHECKS
+# ================================================================
+
+from pyspark.sql import functions as F
+import os
+
+# ------------------------------------------------
+# STEP 0️⃣ — CONFIGURATION
+# ------------------------------------------------
+
+base_path = "/Volumes/workspace/default/hu_de_data/"
+
+# Key output datasets from previous milestones
+tables_to_check = {
+    "orders": "orders_repaired.delta",
+    "items": "order_items_with_seller_30d_on_time.delta",
+    "customers": "olist_customers_dataset_cleaned.delta",
+    "products": "olist_products_dataset_cleaned.delta",
+    "payments": "olist_order_payments_dataset_cleaned.delta",
+    "fact_orders": "fact_orders.delta",
+    "seller_funnel": "seller_monthly_funnel_rates.delta",
+    "seller_category_share": "seller_category_revenue_share.delta",
+    "payment_share": "payment_method_share.delta",
+    "delivery_delay": "delivery_delay_stats.delta"
+}
+
+validation_results = []
+
+# ------------------------------------------------
+# STEP 1️⃣ — CHECK TABLE AVAILABILITY & ROW COUNTS
+# ------------------------------------------------
+
+print("🔍 Checking existence and row counts of Delta tables...\n")
+
+for name, rel_path in tables_to_check.items():
+    path = os.path.join(base_path, rel_path)
+    try:
+        df = spark.read.format("delta").load(path)
+        row_count = df.count()
+        print(f"✅ {name}: {row_count} rows")
+        status = "PASS" if row_count > 0 else "FAIL"
+    except Exception as e:
+        print(f"❌ {name}: Could not load ({e})")
+        row_count = 0
+        status = "FAIL"
+    
+    validation_results.append((name, "Table existence & row count", status, row_count))
+
+# ------------------------------------------------
+# STEP 2️⃣ — NULL CHECKS ON CRITICAL COLUMNS
+# ------------------------------------------------
+
+print("\n🔍 Checking for nulls in primary/critical columns...\n")
+
+critical_columns = {
+    "orders": ["order_id", "customer_id", "purchase_ts_repaired"],
+    "items": ["order_id", "product_id", "seller_id", "price"],
+    "customers": ["customer_id", "customer_state"],
+    "payments": ["order_id", "payment_type", "payment_value"],
+    "fact_orders": ["order_id", "customer_id", "revenue"]
+}
+
+for table, cols in critical_columns.items():
+    path = os.path.join(base_path, f"{table}.delta")
+    try:
+        df = spark.read.format("delta").load(path)
+        for col_name in cols:
+            null_count = df.filter(F.col(col_name).isNull()).count()
+            status = "PASS" if null_count == 0 else "FAIL"
+            validation_results.append((table, f"Nulls in {col_name}", status, null_count))
+            if null_count > 0:
+                print(f"⚠️ {table}.{col_name}: {null_count} nulls found")
+    except Exception as e:
+        print(f"❌ Could not check {table}: {e}")
+
+# ------------------------------------------------
+# STEP 3️⃣ — DUPLICATE PRIMARY KEY CHECKS
+# ------------------------------------------------
+
+print("\n🔍 Checking for duplicate primary keys...\n")
+
+primary_keys = {
+    "orders": ["order_id"],
+    "customers": ["customer_id"],
+    "products": ["product_id"]
+}
+
+for table, pk_cols in primary_keys.items():
+    path = os.path.join(base_path, f"{table}.delta")
+    try:
+        df = spark.read.format("delta").load(path)
+        duplicates = df.groupBy(pk_cols).count().filter("count > 1").count()
+        status = "PASS" if duplicates == 0 else "FAIL"
+        validation_results.append((table, "Duplicate primary keys", status, duplicates))
+        if duplicates > 0:
+            print(f"⚠️ {table}: {duplicates} duplicate PKs found")
+        else:
+            print(f"✅ {table}: No duplicate PKs")
+    except Exception as e:
+        print(f"❌ Could not validate PKs for {table}: {e}")
+
+# ------------------------------------------------
+# STEP 4️⃣ — VALUE RANGE CHECKS
+# ------------------------------------------------
+
+print("\n🔍 Checking value ranges for numeric fields...\n")
+
+try:
+    fact_orders = spark.read.format("delta").load(os.path.join(base_path, "fact_orders.delta"))
+    invalid_revenue = fact_orders.filter((F.col("revenue") < 0) | (F.col("revenue") > 100000)).count()
+    invalid_delay = fact_orders.filter((F.col("delivery_delay_days") < -10) | (F.col("delivery_delay_days") > 100)).count()
+
+    validation_results.append(("fact_orders", "Revenue within range (0–100000)", "PASS" if invalid_revenue == 0 else "FAIL", invalid_revenue))
+    validation_results.append(("fact_orders", "Delivery delay range (-10–100 days)", "PASS" if invalid_delay == 0 else "FAIL", invalid_delay))
+
+    if invalid_revenue > 0:
+        print(f"⚠️ Found {invalid_revenue} invalid revenue values")
+    if invalid_delay > 0:
+        print(f"⚠️ Found {invalid_delay} invalid delivery delays")
+    print("✅ Range checks complete.")
+
+except Exception as e:
+    print(f"❌ Error during range checks: {e}")
+
+# ------------------------------------------------
+# STEP 5️⃣ — AGGREGATE VALIDATION CHECK
+# ------------------------------------------------
+
+print("\n🔍 Validating aggregate totals...\n")
+
+try:
+    kpi_total = spark.sql("SELECT SUM(price + freight_value) AS total_revenue FROM fact_orders").collect()[0][0]
+    kpi_funnel = spark.read.format("delta").load(os.path.join(base_path, "seller_monthly_funnel_rates.delta")).agg(F.sum("orders_P").alias("total_P")).collect()[0][0]
+
+    validation_results.append(("fact_orders vs funnel", "Revenue and orders aligned", "PASS" if kpi_total and kpi_funnel else "CHECK",
